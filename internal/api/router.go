@@ -3,29 +3,32 @@ package api
 import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"time" // 记得引入 time 包
 )
 
 func SetupRouter() *gin.Engine {
 	r := gin.Default()
 
-	// 配置 CORS 允许前端访问
-	config := cors.DefaultConfig()
-	config.AllowAllOrigins = true
-	config.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type"}
+	// 更加宽松的 CORS 配置
+	config := cors.Config{
+		AllowAllOrigins:  true, // 允许所有来源 (开发环境用)
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}
 	r.Use(cors.New(config))
 
 	// API 路由组
 	v1 := r.Group("/api")
 	{
-		// 基础资源
 		v1.GET("/accounts", GetAccounts)
-		v1.GET("/buckets", GetBuckets) // ?account_id=xxx
-
-		// 任务管理
-		v1.POST("/tasks", CreateTask)       // 创建并启动
-		v1.GET("/tasks", ListTasks)         // 列表
-		v1.POST("/tasks/:id/stop", StopTask) // 停止
-		v1.GET("/tasks/:id/errors", GetTaskErrors) // 查看错误日志
+		v1.GET("/buckets", GetBuckets)
+		v1.POST("/tasks", CreateTask)
+		v1.GET("/tasks", ListTasks)
+		v1.POST("/tasks/:id/stop", StopTask)
+		v1.GET("/tasks/:id/errors", GetTaskErrors)
 	}
 
 	return r

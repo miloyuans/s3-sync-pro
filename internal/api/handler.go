@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"log" 
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -20,6 +21,19 @@ import (
 
 // GetAccounts 返回配置文件中的账户列表 (隐藏 SecretKey)
 func GetAccounts(c *gin.Context) {
+    // 打印调试日志，确认请求进来了
+    log.Println("[DEBUG] Receive GetAccounts request")
+
+    if config.GlobalConfig == nil {
+        log.Println("[ERROR] GlobalConfig is nil")
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Server config not loaded"})
+        return
+    }
+
+    if len(config.GlobalConfig.Accounts) == 0 {
+        log.Println("[WARN] No accounts found in config")
+    }
+
 	var safeAccounts []map[string]string
 	for _, acc := range config.GlobalConfig.Accounts {
 		safeAccounts = append(safeAccounts, map[string]string{
@@ -28,6 +42,9 @@ func GetAccounts(c *gin.Context) {
 			"region": acc.Region,
 		})
 	}
+    
+    // 打印即将返回的数据数量
+    log.Printf("[DEBUG] Returning %d accounts", len(safeAccounts))
 	c.JSON(http.StatusOK, safeAccounts)
 }
 
