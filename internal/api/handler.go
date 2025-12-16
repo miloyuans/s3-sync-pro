@@ -183,10 +183,17 @@ func CreateTask(c *gin.Context) {
 
 			// 5. 冲突检测
 			hasConflict, reason := service.CheckPathConflict(newTask)
-			if hasConflict {
-				errors = append(errors, fmt.Sprintf("Conflict: %s -> %s: %s", src.Prefix, finalDestPrefix, reason))
-				continue
-			}
+            if hasConflict {
+                // 优化错误提示：如果是空前缀，显示为 "Root"
+                srcDisplay := src.Prefix
+                if srcDisplay == "" { srcDisplay = "(Root)" }
+                
+                dstDisplay := finalDestPrefix
+                if dstDisplay == "" { dstDisplay = "(Root)" }
+
+                errors = append(errors, fmt.Sprintf("Conflict: %s -> %s: %s", srcDisplay, dstDisplay, reason))
+                continue
+            }
 
 			// 6. 写入数据库
 			coll := database.GetCollection("tasks")
