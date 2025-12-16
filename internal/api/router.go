@@ -29,6 +29,8 @@ func SetupRouter() *gin.Engine {
 		v1.GET("/tasks", ListTasks)
 		v1.POST("/tasks/:id/stop", StopTask)
 		v1.GET("/tasks/:id/errors", GetTaskErrors)
+		v1.GET("/directories", ListDirectories) // ?account_id=x&bucket=x&prefix=x
+
 	}
 
 	return r

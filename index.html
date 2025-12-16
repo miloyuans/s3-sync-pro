@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 跨账户同步 Pro</title>
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
+    <style>
+        body { background-color: #f5f7fa; font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', Arial, sans-serif; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card-header { display: flex; justify-content: space-between; align-items: center; }
+        .box-card { margin-bottom: 20px; }
+        .dir-browser { min-height: 300px; border: 1px solid #dcdfe6; border-radius: 4px; padding: 10px; }
+        .dir-item { cursor: pointer; padding: 8px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #eee; }
+        .dir-item:hover { background-color: #f0f9eb; }
+        .dir-name { display: flex; align-items: center; gap: 8px; flex-grow: 1; }
+        .status-running { color: #67C23A; font-weight: bold; }
+        .status-failed { color: #F56C6C; font-weight: bold; }
+        .status-paused { color: #E6A23C; font-weight: bold; }
+        .tag-group { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 5px; }
+    </style>
+</head>
+<body>
+    <div id="app" class="container">
+        <h1>☁️ S3 跨账户同步 Pro</h1>
+
+        <!-- 创建任务 -->
+        <el-card class="box-card">
+            <template #header>
+                <div class="card-header">
+                    <span>🚀 新建任务</span>
+                    <el-button type="primary" @click="submitTask" :loading="submitting">🚀 开始同步</el-button>
+                </div>
+            </template>
+            <el-form :model="form" label-width="120px">
+                <el-row :gutter="40">
+                    <!-- 左侧：源 -->
+                    <el-col :span="12">
+                        <el-divider content-position="left">📤 源 (Source)</el-divider>
+                        <el-form-item label="源账户">
+                            <el-select v-model="form.source_account_id" placeholder="选择源账户" @change="loadBuckets('source')" style="width: 100%">
+                                <el-option v-for="acc in accounts" :key="acc.id" :label="acc.name + ' (' + acc.region + ')'" :value="acc.id"></el-option>
+                            </el-select>
+                        </el-form-item>
+                        <el-form-item label="源桶">
+                            <el-select v-model="form.source_bucket" placeholder="选择源桶" filterable @change="onSourceBucketChange" style="width: 100%">
+                                <el-option v-for="b in sourceBuckets" :key="b" :label="b" :value="b"></el-option>
+                            </el-select>
+                        </el-form-item>
+                        <el-form-item label="源目录">
+                            <el-button @click="openDirBrowser" :disabled="!form.source_bucket">📁 选择目录</el-button>
+                            <div class="tag-group" v-if="form.source_prefixes.length > 0">
+                                <el-tag v-for="(p, index) in form.source_prefixes" :key="index" closable @close="removePrefix(index)">
+                                    {{ p }}
+                                </el-tag>
+                            </div>
+                            <div v-else style="color: #999; font-size: 12px; margin-top: 5px;">未选择，默认同步整个桶</div>
+                        </el-form-item>
+                    </el-col>
+
+                    <!-- 右侧：目标 -->
+                    <el-col :span="12">
+                        <el-divider content-position="left">📥 目标 (Destination)</el-divider>
+                        <el-form-item label="目标账户">
+                            <el-select v-model="form.dest_account_id" placeholder="选择目标账户" @change="loadBuckets('dest')" style="width: 100%">
+                                <el-option v-for="acc in accounts" :key="acc.id" :label="acc.name + ' (' + acc.region + ')'" :value="acc.id"></el-option>
+                            </el-select>
+                        </el-form-item>
+                        <el-form-item label="目标桶">
+                            <el-select v-model="form.dest_bucket" placeholder="选择目标桶" filterable style="width: 100%">
+                                <el-option v-for="b in destBuckets" :key="b" :label="b" :value="b"></el-option>
+                            </el-select>
+                        </el-form-item>
+                        <el-form-item label="目标路径前缀">
+                            <el-input v-model="form.dest_prefix" :placeholder="destPlaceholder"></el-input>
+                            <div style="color: #909399; font-size: 12px; line-height: 1.4; margin-top: 4px;">
+                                <span v-if="form.source_prefixes.length > 1">多目录模式：只能填前缀（如 'backup/'），源目录将作为子目录保持结构。</span>
+                                <span v-else>单目录模式：留空则保持原名，填值则重命名目标文件夹。</span>
+                            </div>
+                        </el-form-item>
+                    </el-col>
+                </el-row>
+            </el-form>
+        </el-card>
+
+        <!-- 目录选择弹窗 -->
+        <el-dialog v-model="dirDialogVisible" title="选择源目录 (支持多选)" width="600px">
+            <div style="margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
+                <el-button size="small" @click="navigateUp" :disabled="currentPath === ''">⬆️ 返回上级</el-button>
+                <el-input size="small" v-model="currentPath" readonly style="flex-grow: 1;">
+                    <template #prepend>当前路径: /</template>
+                </el-input>
+            </div>
+            
+            <div class="dir-browser" v-loading="loadingDirs">
+                <div v-if="dirList.length === 0" style="text-align: center; color: #999; padding-top: 50px;">
+                    没有子目录 (或权限不足)
+                </div>
+                <div v-for="dir in dirList" :key="dir" class="dir-item">
+                    <div class="dir-name" @click="enterDir(dir)">
+                        📁 {{ dir.replace(currentPath, '') }}
+                    </div>
+                    <el-button type="primary" size="small" plain @click="selectDir(dir)">➕ 添加</el-button>
+                </div>
+            </div>
+            <template #footer>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span>已选: {{ form.source_prefixes.length }} 个目录</span>
+                    <el-button @click="dirDialogVisible = false">完成</el-button>
+                </div>
+            </template>
+        </el-dialog>
+
+        <!-- 任务列表 (简化版) -->
+        <el-card class="box-card">
+            <template #header><span>📋 任务列表</span></template>
+            <el-table :data="tasks" stripe>
+                <el-table-column prop="created_at" label="时间" width="160">
+                    <template #default="scope">{{ formatDate(scope.row.created_at) }}</template>
+                </el-table-column>
+                <el-table-column label="源 -> 目标" min-width="300">
+                    <template #default="scope">
+                        <div><el-tag size="small">Src</el-tag> {{ scope.row.source_bucket }}/{{ scope.row.source_prefix }}</div>
+                        <div style="margin-top:4px;"><el-tag size="small" type="success">Dst</el-tag> {{ scope.row.dest_bucket }}/{{ scope.row.dest_prefix }}</div>
+                    </template>
+                </el-table-column>
+                <el-table-column prop="status" label="状态" width="100">
+                    <template #default="scope"><b :class="'status-' + scope.row.status">{{ scope.row.status }}</b></template>
+                </el-table-column>
+                <el-table-column label="进度" width="150">
+                    <template #default="scope">
+                        <small>成功: {{ scope.row.synced_objects }} / 失败: {{ scope.row.failed_objects }}</small>
+                    </template>
+                </el-table-column>
+            </el-table>
+        </el-card>
+    </div>
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/element-plus"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <script>
+        const API_BASE = 'http://localhost:8080/api';
+        const { createApp, ref, reactive, computed, onMounted } = Vue;
+
+        createApp({
+            setup() {
+                const accounts = ref([]);
+                const sourceBuckets = ref([]);
+                const destBuckets = ref([]);
+                const tasks = ref([]);
+                const submitting = ref(false);
+
+                // 目录浏览器相关
+                const dirDialogVisible = ref(false);
+                const loadingDirs = ref(false);
+                const currentPath = ref("");
+                const dirList = ref([]);
+
+                const form = reactive({
+                    source_account_id: '',
+                    source_bucket: '',
+                    source_prefixes: [], // 数组，支持多选
+                    dest_account_id: '',
+                    dest_bucket: '',
+                    dest_prefix: ''
+                });
+
+                // 动态提示
+                const destPlaceholder = computed(() => {
+                    if (form.source_prefixes.length > 1) return "可选: 输入统一前缀 (如 'backup/')";
+                    return "可选: 输入目标目录名 (留空保持同名)";
+                });
+
+                onMounted(() => {
+                    loadAccounts();
+                    loadTasks();
+                    setInterval(loadTasks, 5000);
+                });
+
+                const loadAccounts = async () => {
+                    const res = await axios.get(`${API_BASE}/accounts`);
+                    accounts.value = res.data;
+                };
+
+                const loadBuckets = async (type) => {
+                    const accId = type === 'source' ? form.source_account_id : form.dest_account_id;
+                    if (!accId) return;
+                    const res = await axios.get(`${API_BASE}/buckets?account_id=${accId}`);
+                    if (type === 'source') sourceBuckets.value = res.data;
+                    else destBuckets.value = res.data;
+                };
+
+                // 源桶改变时清空已选目录
+                const onSourceBucketChange = () => {
+                    form.source_prefixes = [];
+                    currentPath.value = "";
+                };
+
+                // --- 目录浏览器逻辑 ---
+                const openDirBrowser = () => {
+                    currentPath.value = "";
+                    loadDirectories();
+                    dirDialogVisible.value = true;
+                };
+
+                const loadDirectories = async () => {
+                    loadingDirs.value = true;
+                    try {
+                        const res = await axios.get(`${API_BASE}/directories`, {
+                            params: {
+                                account_id: form.source_account_id,
+                                bucket: form.source_bucket,
+                                prefix: currentPath.value
+                            }
+                        });
+                        dirList.value = res.data || [];
+                    } catch (e) {
+                        ElementPlus.ElMessage.error("加载目录失败: " + (e.response?.data?.error || e.message));
+                    } finally {
+                        loadingDirs.value = false;
+                    }
+                };
+
+                const enterDir = (dir) => {
+                    currentPath.value = dir;
+                    loadDirectories();
+                };
+
+                const navigateUp = () => {
+                    // 移除最后一段目录
+                    const parts = currentPath.value.split('/').filter(p => p);
+                    parts.pop();
+                    currentPath.value = parts.length > 0 ? parts.join('/') + '/' : '';
+                    loadDirectories();
+                };
+
+                const selectDir = (dir) => {
+                    if (!form.source_prefixes.includes(dir)) {
+                        form.source_prefixes.push(dir);
+                        ElementPlus.ElMessage.success(`已添加: ${dir}`);
+                    }
+                };
+
+                const removePrefix = (index) => {
+                    form.source_prefixes.splice(index, 1);
+                };
+
+                // --- 提交任务 ---
+                const submitTask = async () => {
+                    if (!form.source_bucket || !form.dest_bucket) return ElementPlus.ElMessage.warning("请补全信息");
+                    
+                    submitting.value = true;
+                    // 如果用户没选目录，默认传空字符串（全桶）
+                    const sources = form.source_prefixes.length > 0 ? form.source_prefixes : [""];
+                    
+                    let successCount = 0;
+                    
+                    // 批量创建任务
+                    for (const srcPrefix of sources) {
+                        // 智能计算目标路径
+                        let finalDestPrefix = form.dest_prefix;
+                        
+                        if (sources.length > 1) {
+                            // 多目录模式：源目录名作为子目录
+                            // 例如 src="data/logs/", dest="backup/" -> 最终目标 "backup/logs/"
+                            const dirName = srcPrefix.split('/').filter(p=>p).pop() || "";
+                            finalDestPrefix = form.dest_prefix + dirName + "/";
+                        } else {
+                            // 单目录模式：如果用户没填目标，保持和源一样（如果是全桶则为空）
+                            if (!finalDestPrefix && srcPrefix) {
+                                finalDestPrefix = srcPrefix;
+                            }
+                        }
+
+                        // 清理 //
+                        finalDestPrefix = finalDestPrefix.replace('//', '/');
+
+                        const taskPayload = {
+                            source_account_id: form.source_account_id,
+                            source_bucket: form.source_bucket,
+                            source_prefix: srcPrefix,
+                            dest_account_id: form.dest_account_id,
+                            dest_bucket: form.dest_bucket,
+                            dest_prefix: finalDestPrefix,
+                            concurrency: 50
+                        };
+
+                        try {
+                            await axios.post(`${API_BASE}/tasks`, taskPayload);
+                            successCount++;
+                        } catch (e) {
+                            ElementPlus.ElMessage.error(`任务 ${srcPrefix} 创建失败: ` + e.response?.data?.error);
+                        }
+                    }
+
+                    submitting.value = false;
+                    if (successCount > 0) {
+                        ElementPlus.ElMessage.success(`成功创建 ${successCount} 个任务`);
+                        form.source_prefixes = []; // 重置
+                        loadTasks();
+                    }
+                };
+
+                const loadTasks = async () => {
+                    const res = await axios.get(`${API_BASE}/tasks`);
+                    tasks.value = res.data;
+                };
+
+                const formatDate = (s) => new Date(s).toLocaleString();
+
+                return {
+                    accounts, sourceBuckets, destBuckets, tasks, form, submitting,
+                    destPlaceholder,
+                    // Dir Browser
+                    dirDialogVisible, loadingDirs, currentPath, dirList,
+                    openDirBrowser, enterDir, navigateUp, selectDir, removePrefix,
+                    // Methods
+                    loadBuckets, onSourceBucketChange, submitTask, formatDate
+                };
+            }
+        }).use(ElementPlus).mount('#app');
+    </script>
+</body>
+</html>

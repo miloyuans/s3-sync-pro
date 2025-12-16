@@ -80,3 +80,21 @@ func GetS3ClientForBucket(ctx context.Context, accountID string, bucketName stri
 
 	return client, nil
 }
+
+// GetAccountClient 获取账户的基础 Client (仅用于 ListBuckets 等不依赖特定 Bucket 的操作)
+func GetAccountClient(ctx context.Context, accountID string) (*s3.Client, error) {
+	acc := appConfig.GetAccount(accountID)
+	if acc == nil {
+		return nil, fmt.Errorf("account not found: %s", accountID)
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(acc.Region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(acc.AccessKey, acc.SecretKey, "")),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return s3.NewFromConfig(cfg), nil
+}

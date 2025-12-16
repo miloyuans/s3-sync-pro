@@ -56,7 +56,7 @@ func GetBuckets(c *gin.Context) {
 		return
 	}
 
-	client, err := service.GetS3Client(accountID)
+	client, err := service.GetAccountClient(context.TODO(), accountID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -172,4 +172,43 @@ func GetTaskErrors(c *gin.Context) {
 	var errs []model.TaskError
 	_ = cursor.All(context.TODO(), &errs)
 	c.JSON(http.StatusOK, errs)
+}
+
+// ListDirectories 列出指定 Bucket/Prefix 下的子目录
+func ListDirectories(c *gin.Context) {
+	accountID := c.Query("account_id")
+	bucket := c.Query("bucket")
+	prefix := c.Query("prefix") // 当前路径，如 "data/"
+
+	if accountID == "" || bucket == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing params"})
+		return
+	}
+
+	// 使用智能 Client，防止跨区域报错
+	client, err := service.GetS3ClientForBucket(context.TODO(), accountID, bucket)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// S3 使用 Delimiter="/" 来模拟目录结构
+	input := &s3.ListObjectsV2Input{
+		Bucket:    aws.String(bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+	}
+
+	output, err := client.ListObjectsV2(context.TODO(), input)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "S3 List Failed: " + err.Error()})
+		return
+	}
+
+	var dirs []string
+	// CommonPrefixes 包含的是“子目录”
+	for _, p := range output.CommonPrefixes {
+		dirs = append(dirs, *p.Prefix)
+	}
+	c.JSON(http.StatusOK, dirs)
 }
