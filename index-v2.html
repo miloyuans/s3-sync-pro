@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>S3 多对多同步引擎</title>
+    <title>S3 跨账户同步引擎 Pro</title>
     <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
     <style>
         body { background-color: #f0f2f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; padding: 20px; }
@@ -20,11 +20,16 @@
         .status-running { color: #67C23A; font-weight: bold; }
         .status-failed { color: #F56C6C; font-weight: bold; }
         .status-paused { color: #E6A23C; }
+
+        /* 目录浏览样式 */
+        .dir-browser-list { max-height: 300px; overflow-y: auto; border: 1px solid #eee; margin-top: 10px; }
+        .dir-item { padding: 8px; cursor: pointer; border-bottom: 1px solid #f9f9f9; display: flex; align-items: center; }
+        .dir-item:hover { background-color: #ecf5ff; }
     </style>
 </head>
 <body>
     <div id="app" class="container">
-        <h2 style="margin-bottom: 20px;">☁️ S3 多对多同步引擎</h2>
+        <h2 style="margin-bottom: 20px;">☁️ S3 跨账户同步引擎 Pro</h2>
 
         <!-- 配置区域 -->
         <el-row :gutter="20">
@@ -43,6 +48,8 @@
                             <div class="list-item-content">
                                 <el-tag size="small">{{ getAccName(item.account_id) }}</el-tag>
                                 <span>{{ item.bucket }} / <b>{{ item.prefix }}</b></span>
+                                <el-tag v-if="!item.prefix.endsWith('/') && item.prefix !== ''" type="warning" size="small" effect="plain">保留目录名</el-tag>
+                                <el-tag v-else type="info" size="small" effect="plain">仅内容</el-tag>
                             </div>
                             <el-button type="danger" link icon="Delete" @click="sources.splice(idx, 1)"></el-button>
                         </div>
@@ -90,7 +97,10 @@
             <template #header>
                 <div class="header-actions">
                     <span>📋 运行任务监控</span>
-                    <el-button icon="Refresh" circle @click="loadTasks"></el-button>
+                    <div style="display: flex; gap: 10px;">
+                         <!-- 这里可以加筛选 -->
+                        <el-button icon="Refresh" circle @click="loadTasks"></el-button>
+                    </div>
                 </div>
             </template>
             <el-table :data="tasks" style="width: 100%" stripe size="small">
@@ -100,6 +110,7 @@
                 <el-table-column label="源 (Src)" min-width="200">
                     <template #default="scope">
                         <div style="font-size:12px; color:#666;">{{ getAccName(scope.row.source_account_id) }}</div>
+                        <!-- 显示时把最终的标准化路径展示出来 -->
                         <b>{{ scope.row.source_bucket }}/{{ scope.row.source_prefix }}</b>
                     </template>
                 </el-table-column>
@@ -125,6 +136,7 @@
                 <el-table-column label="操作" width="100">
                     <template #default="scope">
                         <el-button v-if="scope.row.status === 'running'" type="danger" link size="small" @click="stopTask(scope.row.id)">停止</el-button>
+                        <el-button v-if="scope.row.failed_objects > 0" type="warning" link size="small" @click="showErrors(scope.row.id)">错误</el-button>
                     </template>
                 </el-table-column>
             </el-table>
@@ -144,11 +156,14 @@
                     </el-select>
                 </el-form-item>
                 <el-form-item label="目录">
-                    <el-input v-model="form.prefix" placeholder="例如: logs/ (带斜杠=仅内容) 或 logs (无斜杠=含目录名)">
+                    <el-input v-model="form.prefix" placeholder="例如: logs/ (留空为全桶)">
                         <template #append>
                             <el-button @click="openDirBrowser">选择</el-button>
                         </template>
                     </el-input>
+                    <div v-if="dialogType === 'source'" style="font-size: 12px; color: #909399; margin-top: 5px;">
+                        💡 提示: 以 "/" 结尾代表仅复制内容；不以 "/" 结尾代表复制目录本身。
+                    </div>
                 </el-form-item>
             </el-form>
             <template #footer>
@@ -157,22 +172,48 @@
             </template>
         </el-dialog>
         
-        <!-- 目录浏览器 (复用) -->
-        <el-dialog v-model="dirBrowserVisible" title="选择目录" width="500px">
+        <!-- 目录浏览器 -->
+        <el-dialog v-model="dirBrowserVisible" title="选择S3目录" width="500px">
             <div v-loading="loadingDirs">
-                <div style="margin-bottom:10px;">
-                    <el-button size="small" @click="navUp">⬆️ 上级</el-button>
-                    <span style="margin-left:10px; color:#999;">/{{ currentPath }}</span>
+                <div style="margin-bottom:10px; display: flex; align-items: center;">
+                    <el-button size="small" @click="navUp" :disabled="!currentPath">⬆️ 上级</el-button>
+                    <el-input size="small" v-model="currentPath" readonly style="margin-left: 10px;">
+                        <template #prepend>当前: /</template>
+                    </el-input>
                 </div>
-                <div style="max-height: 300px; overflow-y: auto; border: 1px solid #eee;">
-                    <div v-for="d in dirList" :key="d" style="padding: 8px; cursor: pointer; border-bottom:1px solid #f5f5f5;" @click="enterDir(d)">
+                
+                <div class="dir-browser-list">
+                    <div v-if="dirList.length === 0" style="padding: 20px; text-align: center; color: #ccc;">(无子目录)</div>
+                    <div v-for="d in dirList" :key="d" class="dir-item" @click="enterDir(d)">
                         📁 {{ d.replace(currentPath, '') }}
                     </div>
                 </div>
             </div>
             <template #footer>
-                <el-button type="primary" @click="confirmDir">选择当前: {{ currentPath }}</el-button>
+                <div style="display:flex; justify-content: space-between; align-items: center;">
+                    <!-- 仅在选择源时显示此选项 -->
+                    <div v-if="dialogType === 'source'">
+                        <el-checkbox v-model="keepDirName">保留目录名 (去掉末尾 /)</el-checkbox>
+                    </div>
+                    <div v-else></div> <!-- 占位 -->
+                    
+                    <div>
+                        <el-button @click="dirBrowserVisible = false">取消</el-button>
+                        <el-button type="primary" @click="confirmDir">确定选择</el-button>
+                    </div>
+                </div>
             </template>
+        </el-dialog>
+
+        <!-- 错误详情弹窗 -->
+        <el-dialog v-model="errorDialogVisible" title="错误日志" width="60%">
+            <el-table :data="currentErrors" height="400" border>
+                <el-table-column prop="timestamp" label="时间" width="160">
+                    <template #default="scope">{{ formatDate(scope.row.timestamp) }}</template>
+                </el-table-column>
+                <el-table-column prop="key" label="Key" width="200"></el-table-column>
+                <el-table-column prop="error_msg" label="错误信息"></el-table-column>
+            </el-table>
         </el-dialog>
 
     </div>
@@ -205,6 +246,11 @@
                 const loadingDirs = ref(false);
                 const currentPath = ref('');
                 const dirList = ref([]);
+                const keepDirName = ref(false);
+
+                // 错误显示
+                const errorDialogVisible = ref(false);
+                const currentErrors = ref([]);
 
                 onMounted(() => {
                     loadAccounts();
@@ -229,7 +275,7 @@
                     tasks.value = res.data;
                 };
 
-                // --- 弹窗逻辑 ---
+                // --- 添加弹窗逻辑 ---
                 const openAddDialog = (type) => {
                     dialogType.value = type;
                     form.account_id = '';
@@ -251,6 +297,7 @@
                 const openDirBrowser = () => {
                     if (!form.bucket) return ElementPlus.ElMessage.warning('请先选择账户和桶');
                     currentPath.value = form.prefix || '';
+                    keepDirName.value = false; // 默认不勾选
                     loadDirs();
                     dirBrowserVisible.value = true;
                 };
@@ -272,14 +319,21 @@
                 };
 
                 const enterDir = (d) => { currentPath.value = d; loadDirs(); };
+                
                 const navUp = () => {
                     const parts = currentPath.value.split('/').filter(p=>p);
                     parts.pop();
                     currentPath.value = parts.length ? parts.join('/') + '/' : '';
                     loadDirs();
                 };
+
                 const confirmDir = () => {
-                    form.prefix = currentPath.value;
+                    let finalPath = currentPath.value;
+                    // 如果勾选了保留目录名，且路径以 / 结尾，则去掉它
+                    if (dialogType.value === 'source' && keepDirName.value && finalPath.endsWith('/')) {
+                        finalPath = finalPath.slice(0, -1);
+                    }
+                    form.prefix = finalPath;
                     dirBrowserVisible.value = false;
                 };
 
@@ -293,9 +347,13 @@
                             concurrency: 50
                         };
                         const res = await axios.post(`${API_BASE}/tasks`, payload);
-                        ElementPlus.ElMessage.success(res.data.message);
-                        sources.value = []; // 清空
-                        // dests.value = []; // 目标通常保留方便下次
+                        // 部分成功或全部成功
+                        if (res.data.errors && res.data.errors.length > 0) {
+                            ElementPlus.ElMessage.warning(`部分任务创建失败: ${res.data.errors.join('; ')}`);
+                        } else {
+                            ElementPlus.ElMessage.success(res.data.message);
+                        }
+                        sources.value = []; // 仅清空源，保留目标通常方便
                         loadTasks();
                     } catch (e) {
                         ElementPlus.ElMessage.error(e.response?.data?.error || '提交失败');
@@ -309,8 +367,14 @@
                     ElementPlus.ElMessage.warning('已发送停止信号');
                     loadTasks();
                 };
+                
+                const showErrors = async (id) => {
+                    const res = await axios.get(`${API_BASE}/tasks/${id}/errors`);
+                    currentErrors.value = res.data || [];
+                    errorDialogVisible.value = true;
+                };
 
-                // 辅助
+                // 辅助函数
                 const getAccName = (id) => {
                     const acc = accounts.value.find(a => a.id === id);
                     return acc ? acc.name : id;
@@ -324,9 +388,10 @@
                 return {
                     sources, dests, accounts, tasks, submitting,
                     dialogVisible, dialogType, buckets, form,
-                    dirBrowserVisible, loadingDirs, currentPath, dirList,
+                    dirBrowserVisible, loadingDirs, currentPath, dirList, keepDirName,
+                    errorDialogVisible, currentErrors,
                     openAddDialog, loadBuckets, addToList, openDirBrowser,
-                    enterDir, navUp, confirmDir, submitAll, stopTask,
+                    enterDir, navUp, confirmDir, submitAll, stopTask, showErrors,
                     loadTasks, getAccName, formatDate, calcPercent
                 };
             }

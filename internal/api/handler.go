@@ -124,30 +124,54 @@ func CreateTask(c *gin.Context) {
 	for _, src := range req.Sources {
 		for _, dst := range req.Dests {
 			
-			// 1. 智能计算目标路径
-			// 逻辑：如果源是多目录，为了防止目标覆盖，通常把源目录名拼接到目标前缀后
-			// 例如: Src="logs/", Dst="backup/" -> FinalDst="backup/logs/"
+			// === 🎯 Rsync 风格路径计算逻辑 ===
+			userSrcInput := src.Prefix
 			finalDestPrefix := dst.Prefix
-			
-			// 如果源有多个，且源前缀不为空，我们尝试保留目录结构
-			if len(req.Sources) > 1 && src.Prefix != "" {
-				// 提取源的最后一级目录名
-				// 比如 "data/logs/" -> "logs"
-				cleanSrc := strings.TrimSuffix(src.Prefix, "/")
+
+			// 1. 判断用户意图
+			// 如果用户输入以 "/" 结尾 (如 "logs/") -> 意为 "复制内容" -> 不拼接目录名
+			// 如果用户输入不以 "/" 结尾 (如 "logs")  -> 意为 "复制目录" -> 拼接到目标后
+			wantsFlattening := strings.HasSuffix(userSrcInput, "/")
+
+			// 2. 标准化 SourcePrefix 给 Worker 使用
+			// 无论用户输没输 "/"，为了 S3 List API 能准确列出目录下文件，
+			// 同时也为了 Worker 能正确 TrimPrefix，存入数据库的 SourcePrefix 必须带 "/"
+			// (除非是同步整个桶 "")
+			normalizedSourcePrefix := userSrcInput
+			if normalizedSourcePrefix != "" && !strings.HasSuffix(normalizedSourcePrefix, "/") {
+				normalizedSourcePrefix += "/"
+			}
+
+			// 3. 计算最终目标路径
+			if !wantsFlattening && userSrcInput != "" {
+				// 用户想要保留目录结构 (输入是 "logs")
+				
+				// 提取目录名: "data/logs" -> "logs"
+				cleanSrc := strings.TrimSuffix(userSrcInput, "/") // 防御性清理
 				parts := strings.Split(cleanSrc, "/")
 				dirName := parts[len(parts)-1]
-				
-				// 拼接到目标: "backup/" + "logs" + "/"
-				finalDestPrefix = strings.TrimSuffix(finalDestPrefix, "/") + "/" + dirName + "/"
-				// 清理可能的双斜杠
-				if finalDestPrefix == "/" { finalDestPrefix = "" }
+
+				// 拼接到目标
+				if finalDestPrefix == "" {
+					finalDestPrefix = dirName + "/"
+				} else {
+					// 确保目标中间有分隔符
+					if !strings.HasSuffix(finalDestPrefix, "/") {
+						finalDestPrefix += "/"
+					}
+					finalDestPrefix += dirName + "/"
+				}
 			}
+
+			// 4. 清理路径中的双斜杠 (美观)
+			finalDestPrefix = strings.ReplaceAll(finalDestPrefix, "//", "/")
+			// === 逻辑结束 ===
 
 			newTask := model.Task{
 				ID:              primitive.NewObjectID(),
 				SourceAccountID: src.AccountID,
 				SourceBucket:    src.Bucket,
-				SourcePrefix:    src.Prefix,
+				SourcePrefix:    normalizedSourcePrefix, // 存入标准化后的 (带斜杠)
 				DestAccountID:   dst.AccountID,
 				DestBucket:      dst.Bucket,
 				DestPrefix:      finalDestPrefix,
@@ -157,14 +181,14 @@ func CreateTask(c *gin.Context) {
 				UpdatedAt:       time.Now(),
 			}
 
-			// 2. 冲突检测
+			// 5. 冲突检测
 			hasConflict, reason := service.CheckPathConflict(newTask)
 			if hasConflict {
 				errors = append(errors, fmt.Sprintf("Conflict: %s -> %s: %s", src.Prefix, finalDestPrefix, reason))
 				continue
 			}
 
-			// 3. 写入数据库
+			// 6. 写入数据库
 			coll := database.GetCollection("tasks")
 			_, err := coll.InsertOne(context.TODO(), newTask)
 			if err != nil {
@@ -172,7 +196,7 @@ func CreateTask(c *gin.Context) {
 				continue
 			}
 
-			// 4. 异步启动 Worker
+			// 7. 异步启动 Worker
 			go worker.StartSync(newTask.ID.Hex())
 			createdTasks = append(createdTasks, newTask.ID.Hex())
 		}
