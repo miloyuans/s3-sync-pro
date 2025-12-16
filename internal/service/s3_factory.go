@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -19,6 +18,7 @@ func GetS3Client(accountID string) (*s3.Client, error) {
 		return nil, fmt.Errorf("account not found: %s", accountID)
 	}
 
+	// 加载 AWS 配置
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithRegion(acc.Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(acc.AccessKey, acc.SecretKey, "")),
