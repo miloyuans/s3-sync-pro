@@ -10,11 +10,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager" // 🔥 新增依赖
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo" // 引入官方 mongo 包
+	"go.mongodb.org/mongo-driver/mongo"
 	"golang.org/x/sync/semaphore"
 
 	"s3-sync-pro/internal/database"
@@ -31,10 +32,10 @@ type Syncer struct {
 	task         *model.Task
 	srcClient    *s3.Client
 	destClient   *s3.Client
-	mongoTaskCol *mongo.Collection // 修正为 mongo.Collection
-	mongoErrCol  *mongo.Collection // 修正为 mongo.Collection
+	mongoTaskCol *mongo.Collection
+	mongoErrCol  *mongo.Collection
 
-	// 内存中的原子计数器 (避免频繁写库)
+	// 内存中的原子计数器
 	syncedObj  int64
 	failedObj  int64
 	skippedObj int64
@@ -43,12 +44,9 @@ type Syncer struct {
 
 // StartSync 启动同步任务 (入口函数)
 func StartSync(taskID string) {
-	// 1. 初始化上下文和资源
 	ctx, cancel := context.WithCancel(context.Background())
-	
-	// 修正：同包调用不需要包名前缀
-	RegisterTask(taskID, cancel) 
-	defer UnregisterTask(taskID) 
+	RegisterTask(taskID, cancel)
+	defer UnregisterTask(taskID)
 
 	objID, _ := primitive.ObjectIDFromHex(taskID)
 
@@ -60,53 +58,42 @@ func StartSync(taskID string) {
 		mongoErrCol:  database.GetCollection("task_errors"),
 	}
 
-	// 2. 加载任务配置
 	var task model.Task
 	if err := s.mongoTaskCol.FindOne(ctx, bson.M{"_id": objID}).Decode(&task); err != nil {
 		log.Printf("[Error] Task %s not found: %v", taskID, err)
 		return
 	}
 	s.task = &task
-
-	// 3. 更新状态为 Running
 	s.updateStatus(model.StatusRunning)
 
-	// 4. 获取 S3 客户端
+	// 使用智能 Client 工厂 (解决 301 重定向问题)
 	var err error
-	// 修正：使用 GetS3ClientForBucket
 	s.srcClient, err = service.GetS3ClientForBucket(ctx, task.SourceAccountID, task.SourceBucket)
 	if err != nil {
 		s.failTask(fmt.Sprintf("Init Source Client Failed: %v", err))
 		return
 	}
-
 	s.destClient, err = service.GetS3ClientForBucket(ctx, task.DestAccountID, task.DestBucket)
 	if err != nil {
 		s.failTask(fmt.Sprintf("Init Dest Client Failed: %v", err))
 		return
 	}
 
-	// 5. 启动进度刷新协程 (每3秒写一次DB)
 	go s.progressReporter()
 
-	// 6. 执行核心逻辑
-	err = s.runLoop()
-	if err != nil {
-		// 如果是人为取消，不算失败
+	if err = s.runLoop(); err != nil {
 		if err == context.Canceled {
 			s.updateStatus(model.StatusPaused)
 		} else {
 			s.failTask(err.Error())
 		}
 	} else {
-		// 正常完成
 		s.updateStatus(model.StatusCompleted)
 	}
 }
 
 // runLoop 核心循环：List -> Filter -> Copy
 func (s *Syncer) runLoop() error {
-	// 信号量控制并发
 	sem := semaphore.NewWeighted(int64(s.task.Concurrency))
 	wg := sync.WaitGroup{}
 
@@ -115,38 +102,32 @@ func (s *Syncer) runLoop() error {
 		Prefix: aws.String(s.task.SourcePrefix),
 	}
 
-	// 断点续传：如果有 NextToken，从这里开始
 	if s.task.NextToken != "" {
 		listInput.ContinuationToken = aws.String(s.task.NextToken)
 	}
 
-	log.Printf("Task %s started. Source: %s/%s", s.TaskID.Hex(), s.task.SourceBucket, s.task.SourcePrefix)
+	log.Printf("Task %s started (Stream Mode Ready). %s -> %s", s.TaskID.Hex(), s.task.SourceBucket, s.task.DestBucket)
 
 	for {
-		// 检查暂停/取消信号
 		select {
 		case <-s.Ctx.Done():
 			return s.Ctx.Err()
 		default:
 		}
 
-		// 列举对象
 		output, err := s.srcClient.ListObjectsV2(s.Ctx, listInput)
 		if err != nil {
 			return fmt.Errorf("list objects failed: %v", err)
 		}
 
-		// 遍历当前页的对象
 		for _, obj := range output.Contents {
-			atomic.AddInt64(&s.totalObj, 1) // 发现总数+1
+			atomic.AddInt64(&s.totalObj, 1)
 
-			// 获取信号量凭证
 			if err := sem.Acquire(s.Ctx, 1); err != nil {
-				return err // 上下文取消
+				return err
 			}
 			wg.Add(1)
 
-			// 异步处理每个对象
 			go func(o types.Object) {
 				defer sem.Release(1)
 				defer wg.Done()
@@ -154,27 +135,26 @@ func (s *Syncer) runLoop() error {
 			}(obj)
 		}
 
-		// 更新 Token 以备断点
 		if output.NextContinuationToken != nil {
 			s.updateToken(*output.NextContinuationToken)
 			listInput.ContinuationToken = output.NextContinuationToken
 		} else {
-			break // 遍历结束
+			break
 		}
 	}
 
-	// 等待所有 Worker 结束
 	wg.Wait()
 	return nil
 }
 
-// processObject 单个对象的处理逻辑
+// processObject 单个对象处理：先尝试 Copy，失败则流式中转
 func (s *Syncer) processObject(obj types.Object) {
 	key := *obj.Key
+	// 计算目标 Key
 	relativePath := strings.TrimPrefix(key, s.task.SourcePrefix)
 	destKey := s.task.DestPrefix + relativePath
 
-	// 1. 检查目标是否存在 (增量判断)
+	// 1. 增量检查 (Head Dest)
 	headInput := &s3.HeadObjectInput{
 		Bucket: aws.String(s.task.DestBucket),
 		Key:    aws.String(destKey),
@@ -183,9 +163,9 @@ func (s *Syncer) processObject(obj types.Object) {
 
 	shouldCopy := false
 	if err != nil {
-		shouldCopy = true // 不存在
+		shouldCopy = true // 目标不存在
 	} else {
-		// 存在，对比 Size 和 ETag (ETag 是内容的 MD5，通常可靠)
+		// 存在，对比 Size 和 ETag
 		if *destObj.ContentLength != *obj.Size || *destObj.ETag != *obj.ETag {
 			shouldCopy = true
 		}
@@ -196,44 +176,87 @@ func (s *Syncer) processObject(obj types.Object) {
 		return
 	}
 
-	// 2. 执行复制 (CopyObject)
-	// 跨区域/跨账户复制的关键点：
-	// CopySource 格式必须是 "bucket/key"
-	// 如果 Key 包含特殊字符，建议进行 URL 编码，但 SDK v2 的 aws.String 通常能处理标准字符
+	// 2. 尝试服务器端复制 (CopyObject) - 速度最快
 	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
-
 	copyInput := &s3.CopyObjectInput{
 		Bucket:            aws.String(s.task.DestBucket),
 		Key:               aws.String(destKey),
 		CopySource:        aws.String(copySource),
-		// 🔥 关键点：显式要求复制标签
-		TaggingDirective:  types.TaggingDirectiveCopy, 
-		// 🔥 关键点：显式要求复制元数据 (Content-Type 等)
-		MetadataDirective: types.MetadataDirectiveCopy, 
+		TaggingDirective:  types.TaggingDirectiveCopy,
+		MetadataDirective: types.MetadataDirectiveCopy,
+		// 🔥 关键：跨账户写入必须给目标桶拥有者权限，否则无法读取
+		ACL: types.ObjectCannedACLBucketOwnerFullControl,
 	}
 
 	_, err = s.destClient.CopyObject(s.Ctx, copyInput)
 
-	if err != nil {
-		atomic.AddInt64(&s.failedObj, 1)
-		// 优化错误日志，把源和目标都打出来
-		s.logError(key, fmt.Sprintf("Copy failed from %s to %s: %v", s.task.SourceBucket, s.task.DestBucket, err))
-	} else {
+	if err == nil {
+		// Copy 成功
 		atomic.AddInt64(&s.syncedObj, 1)
+		return
 	}
+
+	// 3. 如果 Copy 失败 (通常是 403 AccessDenied)，降级为流式中转
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "AccessDenied") || strings.Contains(errMsg, "403") {
+		if err := s.streamCopy(key, destKey, obj); err != nil {
+			atomic.AddInt64(&s.failedObj, 1)
+			s.logError(key, fmt.Sprintf("Stream copy failed: %v", err))
+		} else {
+			atomic.AddInt64(&s.syncedObj, 1)
+		}
+		return
+	}
+
+	// 其他错误 (如网络中断)
+	atomic.AddInt64(&s.failedObj, 1)
+	s.logError(key, fmt.Sprintf("Direct copy failed: %v", err))
+}
+
+// streamCopy 流式中转：Source(Get) -> Memory Pipe -> Dest(Upload)
+func (s *Syncer) streamCopy(srcKey, destKey string, srcObj types.Object) error {
+	// A. 从源下载流
+	resp, err := s.srcClient.GetObject(s.Ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.task.SourceBucket),
+		Key:    aws.String(srcKey),
+	})
+	if err != nil {
+		return fmt.Errorf("source download failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// B. 上传到目标
+	// 使用 Manager Uploader 处理大文件分片
+	uploader := manager.NewUploader(s.destClient, func(u *manager.Uploader) {
+		u.PartSize = 10 * 1024 * 1024 // 10MB 分片
+		u.Concurrency = 3             // 内部并发
+	})
+
+	_, err = uploader.Upload(s.Ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(s.task.DestBucket),
+		Key:           aws.String(destKey),
+		Body:          resp.Body,         // 直接对接流
+		ContentLength: srcObj.Size,       // 显式传入大小，优化内存
+		ContentType:   resp.ContentType,
+		Metadata:      resp.Metadata,
+		ACL:           types.ObjectCannedACLBucketOwnerFullControl, // 必填权限
+	})
+
+	if err != nil {
+		return fmt.Errorf("dest upload failed: %w", err)
+	}
+	return nil
 }
 
 // --- 辅助函数 ---
 
-// progressReporter 定时向 MongoDB 刷新内存中的计数器
 func (s *Syncer) progressReporter() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-s.Ctx.Done():
-			s.flushStats() // 最后刷新一次
+			s.flushStats()
 			return
 		case <-ticker.C:
 			s.flushStats()
