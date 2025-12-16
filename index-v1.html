@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 多对多同步引擎</title>
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
+    <style>
+        body { background-color: #f0f2f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .box-card { margin-bottom: 20px; border-radius: 8px; }
+        .header-actions { display: flex; justify-content: space-between; align-items: center; }
+        
+        /* 列表项样式 */
+        .list-group { border: 1px solid #ebeef5; border-radius: 4px; padding: 10px; min-height: 100px; background: #fff; }
+        .list-item { display: flex; align-items: center; justify-content: space-between; padding: 8px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+        .list-item:last-child { border-bottom: none; }
+        .list-item-content { display: flex; align-items: center; gap: 10px; }
+        
+        .status-running { color: #67C23A; font-weight: bold; }
+        .status-failed { color: #F56C6C; font-weight: bold; }
+        .status-paused { color: #E6A23C; }
+    </style>
+</head>
+<body>
+    <div id="app" class="container">
+        <h2 style="margin-bottom: 20px;">☁️ S3 多对多同步引擎</h2>
+
+        <!-- 配置区域 -->
+        <el-row :gutter="20">
+            <!-- 左侧：源配置 -->
+            <el-col :span="10">
+                <el-card class="box-card">
+                    <template #header>
+                        <div class="header-actions">
+                            <span>📤 源列表 (Sources)</span>
+                            <el-button type="primary" size="small" @click="openAddDialog('source')">➕ 添加源</el-button>
+                        </div>
+                    </template>
+                    <div class="list-group">
+                        <div v-if="sources.length === 0" style="text-align: center; color: #999; padding: 30px;">暂无源，请添加</div>
+                        <div v-for="(item, idx) in sources" :key="idx" class="list-item">
+                            <div class="list-item-content">
+                                <el-tag size="small">{{ getAccName(item.account_id) }}</el-tag>
+                                <span>{{ item.bucket }} / <b>{{ item.prefix }}</b></span>
+                            </div>
+                            <el-button type="danger" link icon="Delete" @click="sources.splice(idx, 1)"></el-button>
+                        </div>
+                    </div>
+                </el-card>
+            </el-col>
+
+            <!-- 中间：连接线 -->
+            <el-col :span="4" style="text-align: center; padding-top: 80px;">
+                <div style="font-size: 24px; color: #909399;">➡️ 同步至 ➡️</div>
+                <div style="margin-top: 10px; font-size: 12px; color: #999;">
+                    模式: {{ sources.length }}源 × {{ dests.length }}目标<br>
+                    将生成 {{ sources.length * dests.length }} 个任务
+                </div>
+                <el-button type="success" size="large" style="margin-top: 20px;" :disabled="sources.length === 0 || dests.length === 0" :loading="submitting" @click="submitAll">
+                    🚀 启动引擎
+                </el-button>
+            </el-col>
+
+            <!-- 右侧：目标配置 -->
+            <el-col :span="10">
+                <el-card class="box-card">
+                    <template #header>
+                        <div class="header-actions">
+                            <span>📥 目标列表 (Destinations)</span>
+                            <el-button type="primary" size="small" @click="openAddDialog('dest')">➕ 添加目标</el-button>
+                        </div>
+                    </template>
+                    <div class="list-group">
+                        <div v-if="dests.length === 0" style="text-align: center; color: #999; padding: 30px;">暂无目标，请添加</div>
+                        <div v-for="(item, idx) in dests" :key="idx" class="list-item">
+                            <div class="list-item-content">
+                                <el-tag type="success" size="small">{{ getAccName(item.account_id) }}</el-tag>
+                                <span>{{ item.bucket }} / <b>{{ item.prefix }}</b></span>
+                            </div>
+                            <el-button type="danger" link icon="Delete" @click="dests.splice(idx, 1)"></el-button>
+                        </div>
+                    </div>
+                </el-card>
+            </el-col>
+        </el-row>
+
+        <!-- 任务监控 -->
+        <el-card class="box-card" style="margin-top: 20px;">
+            <template #header>
+                <div class="header-actions">
+                    <span>📋 运行任务监控</span>
+                    <el-button icon="Refresh" circle @click="loadTasks"></el-button>
+                </div>
+            </template>
+            <el-table :data="tasks" style="width: 100%" stripe size="small">
+                <el-table-column prop="created_at" label="创建时间" width="150">
+                    <template #default="scope">{{ formatDate(scope.row.created_at) }}</template>
+                </el-table-column>
+                <el-table-column label="源 (Src)" min-width="200">
+                    <template #default="scope">
+                        <div style="font-size:12px; color:#666;">{{ getAccName(scope.row.source_account_id) }}</div>
+                        <b>{{ scope.row.source_bucket }}/{{ scope.row.source_prefix }}</b>
+                    </template>
+                </el-table-column>
+                <el-table-column label="目标 (Dst)" min-width="200">
+                    <template #default="scope">
+                        <div style="font-size:12px; color:#666;">{{ getAccName(scope.row.dest_account_id) }}</div>
+                        <b>{{ scope.row.dest_bucket }}/{{ scope.row.dest_prefix }}</b>
+                    </template>
+                </el-table-column>
+                <el-table-column label="进度" width="180">
+                    <template #default="scope">
+                        <el-progress :percentage="calcPercent(scope.row)" :status="scope.row.status === 'failed' ? 'exception' : ''"></el-progress>
+                        <div style="font-size: 10px; margin-top: 2px;">
+                            OK: {{ scope.row.synced_objects }} | Skip: {{ scope.row.skipped_objects }} | Err: {{ scope.row.failed_objects }}
+                        </div>
+                    </template>
+                </el-table-column>
+                <el-table-column prop="status" label="状态" width="80">
+                    <template #default="scope">
+                        <span :class="'status-' + scope.row.status">{{ scope.row.status }}</span>
+                    </template>
+                </el-table-column>
+                <el-table-column label="操作" width="100">
+                    <template #default="scope">
+                        <el-button v-if="scope.row.status === 'running'" type="danger" link size="small" @click="stopTask(scope.row.id)">停止</el-button>
+                    </template>
+                </el-table-column>
+            </el-table>
+        </el-card>
+
+        <!-- 添加对话框 -->
+        <el-dialog v-model="dialogVisible" :title="dialogType === 'source' ? '添加源' : '添加目标'" width="500px">
+            <el-form :model="form" label-width="80px">
+                <el-form-item label="账户">
+                    <el-select v-model="form.account_id" placeholder="选择账户" @change="loadBuckets" style="width: 100%">
+                        <el-option v-for="acc in accounts" :key="acc.id" :label="acc.name" :value="acc.id"></el-option>
+                    </el-select>
+                </el-form-item>
+                <el-form-item label="桶">
+                    <el-select v-model="form.bucket" placeholder="选择桶" filterable style="width: 100%">
+                        <el-option v-for="b in buckets" :key="b" :label="b" :value="b"></el-option>
+                    </el-select>
+                </el-form-item>
+                <el-form-item label="目录">
+                    <el-input v-model="form.prefix" placeholder="例如: logs/ (留空为全桶)">
+                        <template #append>
+                            <el-button @click="openDirBrowser">选择</el-button>
+                        </template>
+                    </el-input>
+                </el-form-item>
+            </el-form>
+            <template #footer>
+                <el-button @click="dialogVisible = false">取消</el-button>
+                <el-button type="primary" @click="addToList">确定添加</el-button>
+            </template>
+        </el-dialog>
+        
+        <!-- 目录浏览器 (复用) -->
+        <el-dialog v-model="dirBrowserVisible" title="选择目录" width="500px">
+            <div v-loading="loadingDirs">
+                <div style="margin-bottom:10px;">
+                    <el-button size="small" @click="navUp">⬆️ 上级</el-button>
+                    <span style="margin-left:10px; color:#999;">/{{ currentPath }}</span>
+                </div>
+                <div style="max-height: 300px; overflow-y: auto; border: 1px solid #eee;">
+                    <div v-for="d in dirList" :key="d" style="padding: 8px; cursor: pointer; border-bottom:1px solid #f5f5f5;" @click="enterDir(d)">
+                        📁 {{ d.replace(currentPath, '') }}
+                    </div>
+                </div>
+            </div>
+            <template #footer>
+                <el-button type="primary" @click="confirmDir">选择当前: {{ currentPath }}</el-button>
+            </template>
+        </el-dialog>
+
+    </div>
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/element-plus"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <script src="https://unpkg.com/@element-plus/icons-vue"></script>
+    <script>
+        const API_BASE = 'http://localhost:8080/api';
+        const { createApp, ref, reactive, onMounted } = Vue;
+
+        const app = createApp({
+            setup() {
+                // 数据状态
+                const sources = ref([]);
+                const dests = ref([]);
+                const accounts = ref([]);
+                const tasks = ref([]);
+                const submitting = ref(false);
+
+                // 弹窗状态
+                const dialogVisible = ref(false);
+                const dialogType = ref('source'); // 'source' or 'dest'
+                const buckets = ref([]);
+                const form = reactive({ account_id: '', bucket: '', prefix: '' });
+
+                // 目录浏览器
+                const dirBrowserVisible = ref(false);
+                const loadingDirs = ref(false);
+                const currentPath = ref('');
+                const dirList = ref([]);
+
+                onMounted(() => {
+                    loadAccounts();
+                    loadTasks();
+                    setInterval(loadTasks, 5000);
+                });
+
+                // --- 基础加载 ---
+                const loadAccounts = async () => {
+                    const res = await axios.get(`${API_BASE}/accounts`);
+                    accounts.value = res.data;
+                };
+
+                const loadBuckets = async () => {
+                    if (!form.account_id) return;
+                    const res = await axios.get(`${API_BASE}/buckets?account_id=${form.account_id}`);
+                    buckets.value = res.data;
+                };
+
+                const loadTasks = async () => {
+                    const res = await axios.get(`${API_BASE}/tasks`);
+                    tasks.value = res.data;
+                };
+
+                // --- 弹窗逻辑 ---
+                const openAddDialog = (type) => {
+                    dialogType.value = type;
+                    form.account_id = '';
+                    form.bucket = '';
+                    form.prefix = '';
+                    buckets.value = [];
+                    dialogVisible.value = true;
+                };
+
+                const addToList = () => {
+                    if (!form.bucket) return ElementPlus.ElMessage.warning('请选择桶');
+                    const item = { ...form };
+                    if (dialogType.value === 'source') sources.value.push(item);
+                    else dests.value.push(item);
+                    dialogVisible.value = false;
+                };
+
+                // --- 目录浏览器逻辑 ---
+                const openDirBrowser = () => {
+                    if (!form.bucket) return ElementPlus.ElMessage.warning('请先选择账户和桶');
+                    currentPath.value = form.prefix || '';
+                    loadDirs();
+                    dirBrowserVisible.value = true;
+                };
+
+                const loadDirs = async () => {
+                    loadingDirs.value = true;
+                    try {
+                        const res = await axios.get(`${API_BASE}/directories`, {
+                            params: {
+                                account_id: form.account_id,
+                                bucket: form.bucket,
+                                prefix: currentPath.value
+                            }
+                        });
+                        dirList.value = res.data || [];
+                    } finally {
+                        loadingDirs.value = false;
+                    }
+                };
+
+                const enterDir = (d) => { currentPath.value = d; loadDirs(); };
+                const navUp = () => {
+                    const parts = currentPath.value.split('/').filter(p=>p);
+                    parts.pop();
+                    currentPath.value = parts.length ? parts.join('/') + '/' : '';
+                    loadDirs();
+                };
+                const confirmDir = () => {
+                    form.prefix = currentPath.value;
+                    dirBrowserVisible.value = false;
+                };
+
+                // --- 提交所有 ---
+                const submitAll = async () => {
+                    submitting.value = true;
+                    try {
+                        const payload = {
+                            sources: sources.value,
+                            dests: dests.value,
+                            concurrency: 50
+                        };
+                        const res = await axios.post(`${API_BASE}/tasks`, payload);
+                        ElementPlus.ElMessage.success(res.data.message);
+                        sources.value = []; // 清空
+                        // dests.value = []; // 目标通常保留方便下次
+                        loadTasks();
+                    } catch (e) {
+                        ElementPlus.ElMessage.error(e.response?.data?.error || '提交失败');
+                    } finally {
+                        submitting.value = false;
+                    }
+                };
+
+                const stopTask = async (id) => {
+                    await axios.post(`${API_BASE}/tasks/${id}/stop`);
+                    ElementPlus.ElMessage.warning('已发送停止信号');
+                    loadTasks();
+                };
+
+                // 辅助
+                const getAccName = (id) => {
+                    const acc = accounts.value.find(a => a.id === id);
+                    return acc ? acc.name : id;
+                };
+                const formatDate = (s) => new Date(s).toLocaleString();
+                const calcPercent = (row) => {
+                    if (!row.total_objects) return 0;
+                    return Math.min(100, Math.round((row.synced_objects + row.skipped_objects + row.failed_objects) / row.total_objects * 100));
+                };
+
+                return {
+                    sources, dests, accounts, tasks, submitting,
+                    dialogVisible, dialogType, buckets, form,
+                    dirBrowserVisible, loadingDirs, currentPath, dirList,
+                    openAddDialog, loadBuckets, addToList, openDirBrowser,
+                    enterDir, navUp, confirmDir, submitAll, stopTask,
+                    loadTasks, getAccName, formatDate, calcPercent
+                };
+            }
+        });
+        
+        for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+            app.component(key, component)
+        }
+        app.use(ElementPlus).mount('#app');
+    </script>
+</body>
+</html>

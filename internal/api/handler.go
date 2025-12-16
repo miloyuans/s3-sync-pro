@@ -77,42 +77,118 @@ func GetBuckets(c *gin.Context) {
 	c.JSON(http.StatusOK, buckets)
 }
 
-// CreateTask 创建并启动同步任务
+// 请求体结构，支持多对多
+type CreateTaskRequest struct {
+	// 源列表 (支持多个)
+	Sources []struct {
+		AccountID string `json:"account_id"`
+		Bucket    string `json:"bucket"`
+		Prefix    string `json:"prefix"`
+	} `json:"sources"`
+
+	// 目标列表 (支持多个)
+	Dests []struct {
+		AccountID string `json:"account_id"`
+		Bucket    string `json:"bucket"`
+		Prefix    string `json:"prefix"`
+	} `json:"dests"`
+
+	Concurrency int `json:"concurrency"`
+}
+
+// CreateTask 创建并启动同步任务 (支持多对多批量创建)
 func CreateTask(c *gin.Context) {
-	var req model.Task
+	var req CreateTaskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON: " + err.Error()})
 		return
 	}
 
-	// 1. 初始化默认值
-	req.ID = primitive.NewObjectID()
-	req.Status = model.StatusPending
-	req.CreatedAt = time.Now()
-	req.UpdatedAt = time.Now()
-	if req.Concurrency <= 0 {
-		req.Concurrency = 10
-	}
-
-	// 2. 冲突检测
-	hasConflict, reason := service.CheckPathConflict(req)
-	if hasConflict {
-		c.JSON(http.StatusConflict, gin.H{"error": reason})
+	if len(req.Sources) == 0 || len(req.Dests) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "At least one source and one destination required"})
 		return
 	}
 
-	// 3. 写入数据库
-	coll := database.GetCollection("tasks")
-	_, err := coll.InsertOne(context.TODO(), req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "DB Write Failed"})
-		return
+	// 默认并发数
+	concurrency := req.Concurrency
+	if concurrency <= 0 {
+		concurrency = 20
 	}
 
-	// 4. 异步启动 Worker
-	go worker.StartSync(req.ID.Hex())
+	createdTasks := []string{}
+	errors := []string{}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Task started", "task_id": req.ID.Hex()})
+	// 双重循环：源 x 目标 (笛卡尔积)
+	for _, src := range req.Sources {
+		for _, dst := range req.Dests {
+			
+			// 1. 智能计算目标路径
+			// 逻辑：如果源是多目录，为了防止目标覆盖，通常把源目录名拼接到目标前缀后
+			// 例如: Src="logs/", Dst="backup/" -> FinalDst="backup/logs/"
+			finalDestPrefix := dst.Prefix
+			
+			// 如果源有多个，且源前缀不为空，我们尝试保留目录结构
+			if len(req.Sources) > 1 && src.Prefix != "" {
+				// 提取源的最后一级目录名
+				// 比如 "data/logs/" -> "logs"
+				cleanSrc := strings.TrimSuffix(src.Prefix, "/")
+				parts := strings.Split(cleanSrc, "/")
+				dirName := parts[len(parts)-1]
+				
+				// 拼接到目标: "backup/" + "logs" + "/"
+				finalDestPrefix = strings.TrimSuffix(finalDestPrefix, "/") + "/" + dirName + "/"
+				// 清理可能的双斜杠
+				if finalDestPrefix == "/" { finalDestPrefix = "" }
+			}
+
+			newTask := model.Task{
+				ID:              primitive.NewObjectID(),
+				SourceAccountID: src.AccountID,
+				SourceBucket:    src.Bucket,
+				SourcePrefix:    src.Prefix,
+				DestAccountID:   dst.AccountID,
+				DestBucket:      dst.Bucket,
+				DestPrefix:      finalDestPrefix,
+				Concurrency:     concurrency,
+				Status:          model.StatusPending,
+				CreatedAt:       time.Now(),
+				UpdatedAt:       time.Now(),
+			}
+
+			// 2. 冲突检测
+			hasConflict, reason := service.CheckPathConflict(newTask)
+			if hasConflict {
+				errors = append(errors, fmt.Sprintf("Conflict: %s -> %s: %s", src.Prefix, finalDestPrefix, reason))
+				continue
+			}
+
+			// 3. 写入数据库
+			coll := database.GetCollection("tasks")
+			_, err := coll.InsertOne(context.TODO(), newTask)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("DB Error: %s", err.Error()))
+				continue
+			}
+
+			// 4. 异步启动 Worker
+			go worker.StartSync(newTask.ID.Hex())
+			createdTasks = append(createdTasks, newTask.ID.Hex())
+		}
+	}
+
+	// 返回结果摘要
+	respStatus := http.StatusOK
+	if len(errors) > 0 && len(createdTasks) == 0 {
+		respStatus = http.StatusBadRequest
+	} else if len(errors) > 0 {
+		respStatus = http.StatusPartialContent
+	}
+
+	c.JSON(respStatus, gin.H{
+		"message":       fmt.Sprintf("Created %d tasks, %d failed", len(createdTasks), len(errors)),
+		"created_ids":   createdTasks,
+		"errors":        errors,
+	})
 }
 
 // ListTasks 获取任务列表
