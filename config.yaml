@@ -1,0 +1,18 @@
+# config.yaml
+mongo_uri: "mongodb://localhost:27017"
+db_name: "s3_sync_pro"
+server_port: ":8080"
+
+# 仅管理身份凭证，不含任务逻辑
+accounts:
+  - id: "acc-prod-01"
+    name: "生产环境 (Production)"
+    region: "ap-east-1"
+    access_key: "AKIAXXXXXXXXXXXXXXXX"
+    secret_key: "SECRETXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+  - id: "acc-backup-01"
+    name: "冷备份 (Cold Storage)"
+    region: "us-west-2"
+    access_key: "AKIAYYYYYYYYYYYYYYYY"
+    secret_key: "SECRETYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
