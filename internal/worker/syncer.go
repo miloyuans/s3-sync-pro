@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo" // 引入官方 mongo 包
 	"golang.org/x/sync/semaphore"
 
 	"s3-sync-pro/internal/database"
@@ -30,8 +31,8 @@ type Syncer struct {
 	task         *model.Task
 	srcClient    *s3.Client
 	destClient   *s3.Client
-	mongoTaskCol *database.Collection // tasks 集合
-	mongoErrCol  *database.Collection // task_errors 集合
+	mongoTaskCol *mongo.Collection // 修正为 mongo.Collection
+	mongoErrCol  *mongo.Collection // 修正为 mongo.Collection
 
 	// 内存中的原子计数器 (避免频繁写库)
 	syncedObj  int64
@@ -44,8 +45,11 @@ type Syncer struct {
 func StartSync(taskID string) {
 	// 1. 初始化上下文和资源
 	ctx, cancel := context.WithCancel(context.Background())
-	worker.RegisterTask(taskID, cancel)
-	defer worker.UnregisterTask(taskID)
+	
+	// 修正：同包调用不需要包名前缀
+	RegisterTask(taskID, cancel) 
+	defer UnregisterTask(taskID) 
+
 	objID, _ := primitive.ObjectIDFromHex(taskID)
 
 	s := &Syncer{
@@ -148,10 +152,7 @@ func (s *Syncer) runLoop() error {
 			}(obj)
 		}
 
-		// 等待本页处理完再存 Token? 不，为了效率我们并发处理。
-		// 但 Token 需要在 DB 里更新。这里为了简单，我们保存即将进行的下一页 Token。
-		// 注意：严格的断点续传需要在所有前页任务完成后才更新 Token，
-		// 这里简化为：每次 List 完一页就更新 Token，虽然极端崩溃下可能跳过极少量文件，但性能更好。
+		// 更新 Token 以备断点
 		if output.NextContinuationToken != nil {
 			s.updateToken(*output.NextContinuationToken)
 			listInput.ContinuationToken = output.NextContinuationToken
@@ -168,7 +169,7 @@ func (s *Syncer) runLoop() error {
 // processObject 单个对象的处理逻辑
 func (s *Syncer) processObject(obj types.Object) {
 	key := *obj.Key
-	// 替换 Key 前缀以适应目标路径 (简单的路径映射)
+	// 替换 Key 前缀以适应目标路径
 	// 逻辑：TargetKey = DestPrefix + (Key - SourcePrefix)
 	relativePath := strings.TrimPrefix(key, s.task.SourcePrefix)
 	destKey := s.task.DestPrefix + relativePath
@@ -183,7 +184,6 @@ func (s *Syncer) processObject(obj types.Object) {
 	shouldCopy := false
 	if err != nil {
 		// 404 Not Found -> 需要复制
-		// 注意：AWS SDK v2 的 404 错误处理比较繁琐，这里简化判断
 		shouldCopy = true
 	} else {
 		// 存在，对比 Size 和 ETag
@@ -199,8 +199,7 @@ func (s *Syncer) processObject(obj types.Object) {
 
 	// 2. 执行复制
 	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
-	// URL 编码可能是必须的，视 SDK 版本而定，SDK v2 自动处理了一部分
-	// copySource = url.PathEscape(copySource) 
+	// 如果需要处理特殊字符，可在此处进行 url.PathEscape(copySource)
 
 	_, err = s.destClient.CopyObject(s.Ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(s.task.DestBucket),
