@@ -73,12 +73,14 @@ func StartSync(taskID string) {
 
 	// 4. 获取 S3 客户端
 	var err error
-	s.srcClient, err = service.GetS3Client(task.SourceAccountID)
+	// 修正：使用 GetS3ClientForBucket
+	s.srcClient, err = service.GetS3ClientForBucket(ctx, task.SourceAccountID, task.SourceBucket)
 	if err != nil {
 		s.failTask(fmt.Sprintf("Init Source Client Failed: %v", err))
 		return
 	}
-	s.destClient, err = service.GetS3Client(task.DestAccountID)
+
+	s.destClient, err = service.GetS3ClientForBucket(ctx, task.DestAccountID, task.DestBucket)
 	if err != nil {
 		s.failTask(fmt.Sprintf("Init Dest Client Failed: %v", err))
 		return
@@ -169,8 +171,6 @@ func (s *Syncer) runLoop() error {
 // processObject 单个对象的处理逻辑
 func (s *Syncer) processObject(obj types.Object) {
 	key := *obj.Key
-	// 替换 Key 前缀以适应目标路径
-	// 逻辑：TargetKey = DestPrefix + (Key - SourcePrefix)
 	relativePath := strings.TrimPrefix(key, s.task.SourcePrefix)
 	destKey := s.task.DestPrefix + relativePath
 
@@ -183,10 +183,9 @@ func (s *Syncer) processObject(obj types.Object) {
 
 	shouldCopy := false
 	if err != nil {
-		// 404 Not Found -> 需要复制
-		shouldCopy = true
+		shouldCopy = true // 不存在
 	} else {
-		// 存在，对比 Size 和 ETag
+		// 存在，对比 Size 和 ETag (ETag 是内容的 MD5，通常可靠)
 		if *destObj.ContentLength != *obj.Size || *destObj.ETag != *obj.ETag {
 			shouldCopy = true
 		}
@@ -197,19 +196,28 @@ func (s *Syncer) processObject(obj types.Object) {
 		return
 	}
 
-	// 2. 执行复制
+	// 2. 执行复制 (CopyObject)
+	// 跨区域/跨账户复制的关键点：
+	// CopySource 格式必须是 "bucket/key"
+	// 如果 Key 包含特殊字符，建议进行 URL 编码，但 SDK v2 的 aws.String 通常能处理标准字符
 	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
-	// 如果需要处理特殊字符，可在此处进行 url.PathEscape(copySource)
 
-	_, err = s.destClient.CopyObject(s.Ctx, &s3.CopyObjectInput{
-		Bucket:     aws.String(s.task.DestBucket),
-		Key:        aws.String(destKey),
-		CopySource: aws.String(copySource),
-	})
+	copyInput := &s3.CopyObjectInput{
+		Bucket:            aws.String(s.task.DestBucket),
+		Key:               aws.String(destKey),
+		CopySource:        aws.String(copySource),
+		// 🔥 关键点：显式要求复制标签
+		TaggingDirective:  types.TaggingDirectiveCopy, 
+		// 🔥 关键点：显式要求复制元数据 (Content-Type 等)
+		MetadataDirective: types.MetadataDirectiveCopy, 
+	}
+
+	_, err = s.destClient.CopyObject(s.Ctx, copyInput)
 
 	if err != nil {
 		atomic.AddInt64(&s.failedObj, 1)
-		s.logError(key, err.Error())
+		// 优化错误日志，把源和目标都打出来
+		s.logError(key, fmt.Sprintf("Copy failed from %s to %s: %v", s.task.SourceBucket, s.task.DestBucket, err))
 	} else {
 		atomic.AddInt64(&s.syncedObj, 1)
 	}
