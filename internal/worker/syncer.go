@@ -6,7 +6,6 @@ import (
 	"log"
 	"strings"
 	"sync"
-	"net/url"
 	"sync/atomic"
 	"time"
 
