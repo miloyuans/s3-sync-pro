@@ -150,11 +150,10 @@ func (s *Syncer) runLoop() error {
 // processObject 单个对象处理：先尝试 Copy，失败则流式中转
 func (s *Syncer) processObject(obj types.Object) {
 	key := *obj.Key
-	// 计算目标 Key
 	relativePath := strings.TrimPrefix(key, s.task.SourcePrefix)
 	destKey := s.task.DestPrefix + relativePath
 
-	// 1. 增量检查 (Head Dest)
+	// 1. 检查目标是否存在 (增量判断)
 	headInput := &s3.HeadObjectInput{
 		Bucket: aws.String(s.task.DestBucket),
 		Key:    aws.String(destKey),
@@ -163,7 +162,7 @@ func (s *Syncer) processObject(obj types.Object) {
 
 	shouldCopy := false
 	if err != nil {
-		shouldCopy = true // 目标不存在
+		shouldCopy = true // 不存在
 	} else {
 		// 存在，对比 Size 和 ETag
 		if *destObj.ContentLength != *obj.Size || *destObj.ETag != *obj.ETag {
@@ -176,42 +175,38 @@ func (s *Syncer) processObject(obj types.Object) {
 		return
 	}
 
-	// 2. 尝试服务器端复制 (CopyObject) - 速度最快
+	// 2. 准备复制源路径
+	// 格式要求: bucket-name/key-name
+	// 建议对 key 进行 URL 编码，防止特殊字符导致签名错误，但 SDK v2 的 aws.String 通常处理得很好
+	// 如果遇到文件名含空格或中文报错，可以使用 url.PathEscape(key)
 	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
+
+	// 3. 构建复制请求
 	copyInput := &s3.CopyObjectInput{
 		Bucket:            aws.String(s.task.DestBucket),
 		Key:               aws.String(destKey),
 		CopySource:        aws.String(copySource),
-		TaggingDirective:  types.TaggingDirectiveCopy,
+		
+		// 🔥🔥🔥 核心修复点：显式指令复制标签和元数据 🔥🔥🔥
+		TaggingDirective:  types.TaggingDirectiveCopy, 
 		MetadataDirective: types.MetadataDirectiveCopy,
-		// 🔥 关键：跨账户写入必须给目标桶拥有者权限，否则无法读取
+		
+		// 建议添加 ACL，确保跨账户复制后，目标账户拥有完全控制权
+		// 否则目标账户可能无法修改/删除该文件
 		ACL: types.ObjectCannedACLBucketOwnerFullControl,
 	}
 
 	_, err = s.destClient.CopyObject(s.Ctx, copyInput)
 
-	if err == nil {
-		// Copy 成功
+	if err != nil {
+		atomic.AddInt64(&s.failedObj, 1)
+		// 详细记录错误，方便排查是否是权限问题 (如 AccessDenied)
+		s.logError(key, fmt.Sprintf("Copy failed: %v", err))
+	} else {
 		atomic.AddInt64(&s.syncedObj, 1)
-		return
 	}
-
-	// 3. 如果 Copy 失败 (通常是 403 AccessDenied)，降级为流式中转
-	errMsg := err.Error()
-	if strings.Contains(errMsg, "AccessDenied") || strings.Contains(errMsg, "403") {
-		if err := s.streamCopy(key, destKey, obj); err != nil {
-			atomic.AddInt64(&s.failedObj, 1)
-			s.logError(key, fmt.Sprintf("Stream copy failed: %v", err))
-		} else {
-			atomic.AddInt64(&s.syncedObj, 1)
-		}
-		return
-	}
-
-	// 其他错误 (如网络中断)
-	atomic.AddInt64(&s.failedObj, 1)
-	s.logError(key, fmt.Sprintf("Direct copy failed: %v", err))
 }
+
 
 // streamCopy 流式中转：Source(Get) -> Memory Pipe -> Dest(Upload)
 func (s *Syncer) streamCopy(srcKey, destKey string, srcObj types.Object) error {
