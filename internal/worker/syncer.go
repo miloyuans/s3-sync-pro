@@ -137,12 +137,13 @@ func (s *Syncer) runLoop() error {
 }
 
 // processObject 单个对象的处理逻辑
+// processObject 单个对象的处理逻辑
 func (s *Syncer) processObject(obj types.Object) {
 	key := *obj.Key
 	relativePath := strings.TrimPrefix(key, s.task.SourcePrefix)
 	destKey := s.task.DestPrefix + relativePath
 
-	// 1. 增量检查 (省略...代码同前，保持不变)
+	// 1. 增量检查 (保持不变)
 	headInput := &s3.HeadObjectInput{
 		Bucket: aws.String(s.task.DestBucket),
 		Key:    aws.String(destKey),
@@ -162,31 +163,14 @@ func (s *Syncer) processObject(obj types.Object) {
 	}
 
 	// ==========================================
-	// 2. 获取并筛选标签
+	// 2. 准备标签 (兜底策略：强制设置)
 	// ==========================================
-	var tagQuery string
-	tagOutput, err := s.srcClient.GetObjectTagging(s.Ctx, &s3.GetObjectTaggingInput{
-		Bucket: aws.String(s.task.SourceBucket),
-		Key:    aws.String(key),
-	})
-
-	if err == nil {
-		for _, t := range tagOutput.TagSet {
-			// 筛选 public=yes
-			if *t.Key == "public" && *t.Value == "yes" {
-				// 必须进行 URL 编码，防止特殊字符导致签名错误
-				// 格式: Key=Value
-				tagQuery = fmt.Sprintf("%s=%s", url.QueryEscape(*t.Key), url.QueryEscape(*t.Value))
-				break 
-			}
-		}
-	} else {
-		// 如果读标签都报错（权限问题），最好记录一下，防止静默失败
-		// log.Printf("⚠️ Failed to read tags for %s: %v", key, err)
-	}
+	// 不再去查源文件有没有标签，直接强制给目标文件打上 public=yes
+	// 这样省去了一次 GetObjectTagging 的 API 调用，速度更快
+	targetTag := "public=yes" 
 
 	// ==========================================
-	// 3. 执行复制 (One-Shot: 复制的同时打标签)
+	// 3. 执行复制 (One-Shot: 复制的同时强制覆盖标签)
 	// ==========================================
 	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
 	
@@ -194,18 +178,12 @@ func (s *Syncer) processObject(obj types.Object) {
 		Bucket:            aws.String(s.task.DestBucket),
 		Key:               aws.String(destKey),
 		CopySource:        aws.String(copySource),
-		MetadataDirective: types.MetadataDirectiveCopy,
+		MetadataDirective: types.MetadataDirectiveCopy, // 复制元数据(ContentType等)
 		ACL:               types.ObjectCannedACLBucketOwnerFullControl,
-	}
-
-	// 🔥 关键策略：有标签就 REPLACE，没标签就 COPY
-	if tagQuery != "" {
-		copyInput.TaggingDirective = types.TaggingDirectiveReplace
-		copyInput.Tagging = aws.String(tagQuery)
-	} else {
-		// 源没有 public=yes，或者没权限读到标签
-		// 使用 COPY 让 S3 自动处理（如果源有其他标签会带过来，如果没有则没有）
-		copyInput.TaggingDirective = types.TaggingDirectiveCopy
+		
+		// 🔥 核心修改：强制替换标签 🔥
+		TaggingDirective:  types.TaggingDirectiveReplace,
+		Tagging:           aws.String(targetTag),
 	}
 
 	_, err = s.destClient.CopyObject(s.Ctx, copyInput)
@@ -214,17 +192,17 @@ func (s *Syncer) processObject(obj types.Object) {
 	if err != nil {
 		errMsg := err.Error()
 
-		// 降级到流式 (需要透传 tagQuery)
+		// 降级到流式 (需要透传 targetTag)
 		if strings.Contains(errMsg, "AccessDenied") || strings.Contains(errMsg, "403") {
-			// 将筛选好的标签传给流式上传
-			errStream := s.streamCopy(key, destKey, obj, tagQuery)
+			// 将强制标签传给流式上传
+			errStream := s.streamCopy(key, destKey, obj, targetTag)
 			if errStream == nil {
 				atomic.AddInt64(&s.syncedObj, 1)
 				return
 			}
 			err = errStream
 		} else if strings.Contains(errMsg, "AccessControlListNotSupported") {
-			// 降级 ACL
+			// 降级 ACL (依然保留标签)
 			copyInput.ACL = "" 
 			_, errRetry := s.destClient.CopyObject(s.Ctx, copyInput)
 			if errRetry == nil {
@@ -263,7 +241,12 @@ func (s *Syncer) streamCopy(key, destKey string, obj types.Object, tagQuery stri
 		ContentType:   resp.ContentType,
 		Metadata:      resp.Metadata,
 		ACL:           types.ObjectCannedACLBucketOwnerFullControl,
+		
+		// 🔥 流式上传也强制带上标签
+		Tagging:       aws.String(tagQuery),
 	}
+
+	_, err = uploader.Upload(s.Ctx, putInput)
 
 	// 🔥 如果有标签，直接在上传时带上 (One-Shot)
 	if tagQuery != "" {
