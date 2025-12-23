@@ -176,63 +176,76 @@ func (s *Syncer) processObject(obj types.Object) {
 		return
 	}
 
-	// 2. 获取源对象标签 (显式获取，解决跨账户丢失问题)
-	// 注意：这会增加一次 API 调用，但能保证标签准确性
+	// 2. 获取标签 (尝试获取，失败不阻断)
+	var tagQuery string
 	tagOutput, err := s.srcClient.GetObjectTagging(s.Ctx, &s3.GetObjectTaggingInput{
 		Bucket: aws.String(s.task.SourceBucket),
 		Key:    aws.String(key),
 	})
-	
-	var tagQuery string
 	if err == nil && len(tagOutput.TagSet) > 0 {
-		// 2.1 可以在这里做逻辑判断：比如只保留 public:yes
-		// 目前逻辑：保留所有源标签
-		// S3 API 要求 Tagging 必须是 URL Encoded 字符串: "Key1=Value1&Key2=Value2"
 		var params []string
 		for _, t := range tagOutput.TagSet {
-			// 简单的 Key=Value 拼接 (SDK 内部通常会自动处理 URL 编码，但在 Header 中最好手动拼接)
-			// 注意：这里简化处理，假设 Key/Value 不含极特殊字符。严谨做法需 URL Encode。
+			// 简单拼接，实际生产建议 url.QueryEscape
 			params = append(params, fmt.Sprintf("%s=%s", *t.Key, *t.Value))
-			
-			// 如果你想实现“只有 public:yes 才复制”，可以在这里加 if 判断
-			// if *t.Key == "public" && *t.Value == "yes" { ... }
 		}
 		if len(params) > 0 {
 			tagQuery = strings.Join(params, "&")
 		}
-	} else {
-		// 如果获取标签失败（比如没权限）或者没有标签，记录一下日志但继续复制文件
-		// 很多时候 List 权限有，但 GetObjectTagging 权限没有
-		// log.Printf("Warning: Failed to get tags for %s: %v", key, err)
 	}
 
-	// 3. 执行复制
+	// 3. 准备复制参数
 	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
-	
 	copyInput := &s3.CopyObjectInput{
 		Bucket:            aws.String(s.task.DestBucket),
 		Key:               aws.String(destKey),
 		CopySource:        aws.String(copySource),
-		MetadataDirective: types.MetadataDirectiveCopy, // 保持元数据(ContentType等)一致
-		ACL:               types.ObjectCannedACLBucketOwnerFullControl, // 移交所有权
+		MetadataDirective: types.MetadataDirectiveCopy,
+		// 默认尝试带 ACL (移交所有权)
+		ACL:               types.ObjectCannedACLBucketOwnerFullControl,
 	}
 
-	// 4. 应用标签策略
+	// 应用标签策略
 	if tagQuery != "" {
-		// 策略 A: 显式写入我们查到的标签
 		copyInput.TaggingDirective = types.TaggingDirectiveReplace
 		copyInput.Tagging = aws.String(tagQuery)
 	} else {
-		// 策略 B: 如果源没标签，或没查到，尝试让 S3 自己复制（兜底）
-		// 如果源真的无标签，COPY 也是无标签，结果一样
 		copyInput.TaggingDirective = types.TaggingDirectiveCopy
 	}
 
+	// 4. 执行复制 (带错误重试与降级)
 	_, err = s.destClient.CopyObject(s.Ctx, copyInput)
 
 	if err != nil {
+		errMsg := err.Error()
+		
+		// 🔥 智能降级：如果报错是因为目标桶不支持 ACL (Bucket Owner Enforced)
+		// AccessControlListNotSupported: The bucket does not allow ACLs
+		// InvalidRequest: The bucket owner enforced setting...
+		if strings.Contains(errMsg, "AccessControlListNotSupported") || 
+		   strings.Contains(errMsg, "InvalidRequest") || 
+		   strings.Contains(errMsg, "AccessDenied") {
+			
+			// 尝试移除 ACL 再次请求
+			// log.Printf("⚠️ Retrying without ACL for key: %s", key)
+			copyInput.ACL = "" // 清空 ACL
+			_, errRetry := s.destClient.CopyObject(s.Ctx, copyInput)
+			if errRetry == nil {
+				atomic.AddInt64(&s.syncedObj, 1)
+				return // 重试成功，直接返回
+			}
+			// 重试也失败，更新错误信息
+			err = errRetry 
+		}
+
+		// 记录失败
 		atomic.AddInt64(&s.failedObj, 1)
-		s.logError(key, fmt.Sprintf("Copy failed: %v", err))
+		
+		// 🔥🔥🔥 核心修改：在终端打印详细错误，不再通过 Web 猜 🔥🔥🔥
+		log.Printf("❌ [Copy Error] Key: %s | Source: %s | Dest: %s | Error: %v", 
+			key, s.task.SourceBucket, s.task.DestBucket, err)
+		
+		// 写入 DB 供 Web 查看
+		s.logError(key, err.Error())
 	} else {
 		atomic.AddInt64(&s.syncedObj, 1)
 	}
