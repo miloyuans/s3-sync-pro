@@ -23,33 +23,27 @@ import (
 	"s3-sync-pro/internal/service"
 )
 
-// Syncer 任务执行器结构体
 type Syncer struct {
-	TaskID primitive.ObjectID
-	Ctx    context.Context // 用于取消任务
-	Cancel context.CancelFunc
-
+	TaskID       primitive.ObjectID
+	Ctx          context.Context
+	Cancel       context.CancelFunc
 	task         *model.Task
 	srcClient    *s3.Client
 	destClient   *s3.Client
 	mongoTaskCol *mongo.Collection
 	mongoErrCol  *mongo.Collection
-
-	// 内存中的原子计数器
-	syncedObj  int64
-	failedObj  int64
-	skippedObj int64
-	totalObj   int64
+	syncedObj    int64
+	failedObj    int64
+	skippedObj   int64
+	totalObj     int64
 }
 
-// StartSync 启动同步任务 (入口函数)
 func StartSync(taskID string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	RegisterTask(taskID, cancel)
 	defer UnregisterTask(taskID)
 
 	objID, _ := primitive.ObjectIDFromHex(taskID)
-
 	s := &Syncer{
 		TaskID:       objID,
 		Ctx:          ctx,
@@ -66,7 +60,6 @@ func StartSync(taskID string) {
 	s.task = &task
 	s.updateStatus(model.StatusRunning)
 
-	// 使用智能 Client 工厂 (解决 301 重定向问题)
 	var err error
 	s.srcClient, err = service.GetS3ClientForBucket(ctx, task.SourceAccountID, task.SourceBucket)
 	if err != nil {
@@ -92,7 +85,6 @@ func StartSync(taskID string) {
 	}
 }
 
-// runLoop 核心循环：List -> Filter -> Copy
 func (s *Syncer) runLoop() error {
 	sem := semaphore.NewWeighted(int64(s.task.Concurrency))
 	wg := sync.WaitGroup{}
@@ -101,12 +93,11 @@ func (s *Syncer) runLoop() error {
 		Bucket: aws.String(s.task.SourceBucket),
 		Prefix: aws.String(s.task.SourcePrefix),
 	}
-
 	if s.task.NextToken != "" {
 		listInput.ContinuationToken = aws.String(s.task.NextToken)
 	}
 
-	log.Printf("Task %s started (Stream Mode Ready). %s -> %s", s.TaskID.Hex(), s.task.SourceBucket, s.task.DestBucket)
+	log.Printf("Task %s started. Source: %s/%s", s.TaskID.Hex(), s.task.SourceBucket, s.task.SourcePrefix)
 
 	for {
 		select {
@@ -122,12 +113,10 @@ func (s *Syncer) runLoop() error {
 
 		for _, obj := range output.Contents {
 			atomic.AddInt64(&s.totalObj, 1)
-
 			if err := sem.Acquire(s.Ctx, 1); err != nil {
 				return err
 			}
 			wg.Add(1)
-
 			go func(o types.Object) {
 				defer sem.Release(1)
 				defer wg.Done()
@@ -142,30 +131,26 @@ func (s *Syncer) runLoop() error {
 			break
 		}
 	}
-
 	wg.Wait()
 	return nil
 }
 
-// processObject 单个对象处理：先尝试 Copy，失败则流式中转
 // processObject 单个对象的处理逻辑
 func (s *Syncer) processObject(obj types.Object) {
 	key := *obj.Key
 	relativePath := strings.TrimPrefix(key, s.task.SourcePrefix)
 	destKey := s.task.DestPrefix + relativePath
 
-	// 1. 检查目标是否存在 (增量判断)
+	// 1. 增量检查
 	headInput := &s3.HeadObjectInput{
 		Bucket: aws.String(s.task.DestBucket),
 		Key:    aws.String(destKey),
 	}
 	destObj, err := s.destClient.HeadObject(s.Ctx, headInput)
-
 	shouldCopy := false
 	if err != nil {
-		shouldCopy = true // 不存在
+		shouldCopy = true
 	} else {
-		// 存在，对比 Size 和 ETag
 		if *destObj.ContentLength != *obj.Size || *destObj.ETag != *obj.ETag {
 			shouldCopy = true
 		}
@@ -176,7 +161,7 @@ func (s *Syncer) processObject(obj types.Object) {
 		return
 	}
 
-	// 2. 获取标签 (尝试获取，失败不阻断)
+	// 2. 获取标签
 	var tagQuery string
 	tagOutput, err := s.srcClient.GetObjectTagging(s.Ctx, &s3.GetObjectTaggingInput{
 		Bucket: aws.String(s.task.SourceBucket),
@@ -185,7 +170,6 @@ func (s *Syncer) processObject(obj types.Object) {
 	if err == nil && len(tagOutput.TagSet) > 0 {
 		var params []string
 		for _, t := range tagOutput.TagSet {
-			// 简单拼接，实际生产建议 url.QueryEscape
 			params = append(params, fmt.Sprintf("%s=%s", *t.Key, *t.Value))
 		}
 		if len(params) > 0 {
@@ -193,18 +177,15 @@ func (s *Syncer) processObject(obj types.Object) {
 		}
 	}
 
-	// 3. 准备复制参数
+	// 3. 尝试直接 CopyObject (最快)
 	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
 	copyInput := &s3.CopyObjectInput{
 		Bucket:            aws.String(s.task.DestBucket),
 		Key:               aws.String(destKey),
 		CopySource:        aws.String(copySource),
 		MetadataDirective: types.MetadataDirectiveCopy,
-		// 默认尝试带 ACL (移交所有权)
 		ACL:               types.ObjectCannedACLBucketOwnerFullControl,
 	}
-
-	// 应用标签策略
 	if tagQuery != "" {
 		copyInput.TaggingDirective = types.TaggingDirectiveReplace
 		copyInput.Tagging = aws.String(tagQuery)
@@ -212,78 +193,88 @@ func (s *Syncer) processObject(obj types.Object) {
 		copyInput.TaggingDirective = types.TaggingDirectiveCopy
 	}
 
-	// 4. 执行复制 (带错误重试与降级)
 	_, err = s.destClient.CopyObject(s.Ctx, copyInput)
 
+	// 4. 错误处理与降级
 	if err != nil {
 		errMsg := err.Error()
-		
-		// 🔥 智能降级：如果报错是因为目标桶不支持 ACL (Bucket Owner Enforced)
-		// AccessControlListNotSupported: The bucket does not allow ACLs
-		// InvalidRequest: The bucket owner enforced setting...
-		if strings.Contains(errMsg, "AccessControlListNotSupported") || 
-		   strings.Contains(errMsg, "InvalidRequest") || 
-		   strings.Contains(errMsg, "AccessDenied") {
+
+		// 场景 A: 权限不足 (AccessDenied/403) -> 切换流式中转
+		if strings.Contains(errMsg, "AccessDenied") || strings.Contains(errMsg, "403") {
+			// log.Printf("⚠️ Direct Copy denied, switching to stream for: %s", key)
 			
-			// 尝试移除 ACL 再次请求
-			// log.Printf("⚠️ Retrying without ACL for key: %s", key)
-			copyInput.ACL = "" // 清空 ACL
+			// 调用流式复制
+			errStream := s.streamCopy(key, destKey, obj, tagQuery)
+			if errStream == nil {
+				atomic.AddInt64(&s.syncedObj, 1)
+				return // 挽救成功
+			}
+			err = errStream // 如果流式也失败，记录流式的错误
+		} 
+		
+		// 场景 B: ACL 不支持 (BucketOwnerEnforced) -> 去掉 ACL 重试
+		if strings.Contains(errMsg, "AccessControlListNotSupported") || strings.Contains(errMsg, "InvalidRequest") {
+			copyInput.ACL = "" 
 			_, errRetry := s.destClient.CopyObject(s.Ctx, copyInput)
 			if errRetry == nil {
 				atomic.AddInt64(&s.syncedObj, 1)
-				return // 重试成功，直接返回
+				return
 			}
-			// 重试也失败，更新错误信息
-			err = errRetry 
+			err = errRetry
 		}
 
-		// 记录失败
 		atomic.AddInt64(&s.failedObj, 1)
-		
-		// 🔥🔥🔥 核心修改：在终端打印详细错误，不再通过 Web 猜 🔥🔥🔥
-		log.Printf("❌ [Copy Error] Key: %s | Source: %s | Dest: %s | Error: %v", 
-			key, s.task.SourceBucket, s.task.DestBucket, err)
-		
-		// 写入 DB 供 Web 查看
+		log.Printf("❌ [Sync Error] Key: %s | Err: %v", key, err)
 		s.logError(key, err.Error())
 	} else {
 		atomic.AddInt64(&s.syncedObj, 1)
 	}
 }
 
-// streamCopy 流式中转：Source(Get) -> Memory Pipe -> Dest(Upload)
-func (s *Syncer) streamCopy(srcKey, destKey string, srcObj types.Object) error {
-	// A. 从源下载流
+// streamCopy 流式复制：下载流 -> 内存管道 -> 上传流 (不落盘)
+func (s *Syncer) streamCopy(key, destKey string, obj types.Object, tagQuery string) error {
+	// 1. 获取源文件下载流
 	resp, err := s.srcClient.GetObject(s.Ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.task.SourceBucket),
-		Key:    aws.String(srcKey),
+		Key:    aws.String(key),
 	})
 	if err != nil {
 		return fmt.Errorf("source download failed: %w", err)
 	}
+	// 关键：函数结束时关闭流，释放连接
 	defer resp.Body.Close()
 
-	// B. 上传到目标
-	// 使用 Manager Uploader 处理大文件分片
-	uploader := manager.NewUploader(s.destClient, func(u *manager.Uploader) {
-		u.PartSize = 10 * 1024 * 1024 // 10MB 分片
-		u.Concurrency = 3             // 内部并发
-	})
+	// 2. 初始化上传管理器
+	// PartSize: 5MB (默认)，Concurrency: 5 (默认)
+	// Manager 会自动读取 resp.Body，并在内存中缓存一小部分数据进行分片上传
+	uploader := manager.NewUploader(s.destClient)
 
-	_, err = uploader.Upload(s.Ctx, &s3.PutObjectInput{
+	putInput := &s3.PutObjectInput{
 		Bucket:        aws.String(s.task.DestBucket),
 		Key:           aws.String(destKey),
-		Body:          resp.Body,         // 直接对接流
-		ContentLength: srcObj.Size,       // 显式传入大小，优化内存
+		Body:          resp.Body,       // 🔥 直接对接下载流
+		ContentLength: obj.Size,        // 显式告知大小，避免 SDK 缓冲整个文件
 		ContentType:   resp.ContentType,
 		Metadata:      resp.Metadata,
-		ACL:           types.ObjectCannedACLBucketOwnerFullControl, // 必填权限
-	})
-
-	if err != nil {
-		return fmt.Errorf("dest upload failed: %w", err)
+		Tagging:       aws.String(tagQuery), // 上传时直接打标签
+		ACL:           types.ObjectCannedACLBucketOwnerFullControl,
 	}
-	return nil
+	
+	// 如果 tag 为空，AWS SDK 会忽略 Tagging 字段
+	if tagQuery == "" {
+		putInput.Tagging = nil
+	}
+
+	_, err = uploader.Upload(s.Ctx, putInput)
+	if err != nil {
+		// 再次降级：如果流式上传也因为 ACL 报错，尝试去掉 ACL
+		if strings.Contains(err.Error(), "AccessControlListNotSupported") {
+			putInput.ACL = ""
+			_, err = uploader.Upload(s.Ctx, putInput)
+		}
+	}
+
+	return err
 }
 
 // --- 辅助函数 ---
