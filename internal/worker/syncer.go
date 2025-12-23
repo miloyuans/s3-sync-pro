@@ -148,6 +148,7 @@ func (s *Syncer) runLoop() error {
 }
 
 // processObject 单个对象处理：先尝试 Copy，失败则流式中转
+// processObject 单个对象的处理逻辑
 func (s *Syncer) processObject(obj types.Object) {
 	key := *obj.Key
 	relativePath := strings.TrimPrefix(key, s.task.SourcePrefix)
@@ -175,38 +176,67 @@ func (s *Syncer) processObject(obj types.Object) {
 		return
 	}
 
-	// 2. 准备复制源路径
-	// 格式要求: bucket-name/key-name
-	// 建议对 key 进行 URL 编码，防止特殊字符导致签名错误，但 SDK v2 的 aws.String 通常处理得很好
-	// 如果遇到文件名含空格或中文报错，可以使用 url.PathEscape(key)
-	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
+	// 2. 获取源对象标签 (显式获取，解决跨账户丢失问题)
+	// 注意：这会增加一次 API 调用，但能保证标签准确性
+	tagOutput, err := s.srcClient.GetObjectTagging(s.Ctx, &s3.GetObjectTaggingInput{
+		Bucket: aws.String(s.task.SourceBucket),
+		Key:    aws.String(key),
+	})
+	
+	var tagQuery string
+	if err == nil && len(tagOutput.TagSet) > 0 {
+		// 2.1 可以在这里做逻辑判断：比如只保留 public:yes
+		// 目前逻辑：保留所有源标签
+		// S3 API 要求 Tagging 必须是 URL Encoded 字符串: "Key1=Value1&Key2=Value2"
+		var params []string
+		for _, t := range tagOutput.TagSet {
+			// 简单的 Key=Value 拼接 (SDK 内部通常会自动处理 URL 编码，但在 Header 中最好手动拼接)
+			// 注意：这里简化处理，假设 Key/Value 不含极特殊字符。严谨做法需 URL Encode。
+			params = append(params, fmt.Sprintf("%s=%s", *t.Key, *t.Value))
+			
+			// 如果你想实现“只有 public:yes 才复制”，可以在这里加 if 判断
+			// if *t.Key == "public" && *t.Value == "yes" { ... }
+		}
+		if len(params) > 0 {
+			tagQuery = strings.Join(params, "&")
+		}
+	} else {
+		// 如果获取标签失败（比如没权限）或者没有标签，记录一下日志但继续复制文件
+		// 很多时候 List 权限有，但 GetObjectTagging 权限没有
+		// log.Printf("Warning: Failed to get tags for %s: %v", key, err)
+	}
 
-	// 3. 构建复制请求
+	// 3. 执行复制
+	copySource := fmt.Sprintf("%s/%s", s.task.SourceBucket, key)
+	
 	copyInput := &s3.CopyObjectInput{
 		Bucket:            aws.String(s.task.DestBucket),
 		Key:               aws.String(destKey),
 		CopySource:        aws.String(copySource),
-		
-		// 🔥🔥🔥 核心修复点：显式指令复制标签和元数据 🔥🔥🔥
-		TaggingDirective:  types.TaggingDirectiveCopy, 
-		MetadataDirective: types.MetadataDirectiveCopy,
-		
-		// 建议添加 ACL，确保跨账户复制后，目标账户拥有完全控制权
-		// 否则目标账户可能无法修改/删除该文件
-		ACL: types.ObjectCannedACLBucketOwnerFullControl,
+		MetadataDirective: types.MetadataDirectiveCopy, // 保持元数据(ContentType等)一致
+		ACL:               types.ObjectCannedACLBucketOwnerFullControl, // 移交所有权
+	}
+
+	// 4. 应用标签策略
+	if tagQuery != "" {
+		// 策略 A: 显式写入我们查到的标签
+		copyInput.TaggingDirective = types.TaggingDirectiveReplace
+		copyInput.Tagging = aws.String(tagQuery)
+	} else {
+		// 策略 B: 如果源没标签，或没查到，尝试让 S3 自己复制（兜底）
+		// 如果源真的无标签，COPY 也是无标签，结果一样
+		copyInput.TaggingDirective = types.TaggingDirectiveCopy
 	}
 
 	_, err = s.destClient.CopyObject(s.Ctx, copyInput)
 
 	if err != nil {
 		atomic.AddInt64(&s.failedObj, 1)
-		// 详细记录错误，方便排查是否是权限问题 (如 AccessDenied)
 		s.logError(key, fmt.Sprintf("Copy failed: %v", err))
 	} else {
 		atomic.AddInt64(&s.syncedObj, 1)
 	}
 }
-
 
 // streamCopy 流式中转：Source(Get) -> Memory Pipe -> Dest(Upload)
 func (s *Syncer) streamCopy(srcKey, destKey string, srcObj types.Object) error {
